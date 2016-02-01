@@ -43,6 +43,12 @@
 
         <dependency>
             <groupId>ddf.catalog.core</groupId>
+            <artifactId>catalog-core-api</artifactId>
+            <version>${ddfcatalog.version}</version>
+        </dependency>
+
+        <dependency>
+            <groupId>ddf.catalog.core</groupId>
             <artifactId>catalog-core-api-impl</artifactId>
             <version>${ddfcatalog.version}</version>
         </dependency>
@@ -74,13 +80,13 @@
         <dependency>
             <groupId>org.codice.imaging.nitf</groupId>
             <artifactId>codice-imaging-nitf-core</artifactId>
-            <version>0.1-SNAPSHOT</version>
+            <version>0.2-SNAPSHOT</version>
         </dependency>
 
         <dependency>
             <groupId>org.codice.imaging.nitf</groupId>
             <artifactId>codice-imaging-cgm</artifactId>
-            <version>0.1-SNAPSHOT</version>
+            <version>0.2-SNAPSHOT</version>
         </dependency>
 
         <dependency>

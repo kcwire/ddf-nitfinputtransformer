@@ -37,7 +37,7 @@ import ddf.catalog.source.UnsupportedQueryException;
 import ddf.catalog.source.SourceUnavailableException;
 import ddf.catalog.federation.FederationException;
 import ddf.catalog.operation.QueryRequest;
-import ddf.catalog.operation.QueryResponseImpl;
+import ddf.catalog.operation.impl.QueryResponseImpl;
 
 public class TestBasicInputTransformer {
     private static final BundleContext context = mock(BundleContext.class);

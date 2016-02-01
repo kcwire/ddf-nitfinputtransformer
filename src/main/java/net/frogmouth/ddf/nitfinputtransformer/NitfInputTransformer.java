@@ -10,7 +10,7 @@
  */
 package net.frogmouth.ddf.nitfinputtransformer;
 
-import java.awt.*;
+import java.awt.Graphics2D;
 import java.awt.image.BufferedImage;
 import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
@@ -20,7 +20,6 @@ import java.text.ParseException;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Date;
-import java.util.EnumSet;
 import java.util.List;
 
 import javax.imageio.ImageIO;
@@ -30,23 +29,28 @@ import org.apache.commons.lang.StringUtils;
 import org.apache.commons.lang3.StringEscapeUtils;
 import org.codice.imaging.cgm.CgmParser;
 import org.codice.imaging.cgm.CgmRenderer;
-import org.codice.imaging.nitf.core.ImageCoordinates;
-import org.codice.imaging.nitf.core.ImageCoordinatesRepresentation;
-import org.codice.imaging.nitf.core.Nitf;
-import org.codice.imaging.nitf.core.NitfDateTime;
-import org.codice.imaging.nitf.core.NitfFileFactory;
-import org.codice.imaging.nitf.core.NitfFileSecurityMetadata;
-import org.codice.imaging.nitf.core.NitfGraphicSegment;
-import org.codice.imaging.nitf.core.NitfImageSegment;
-import org.codice.imaging.nitf.core.NitfLabelSegment;
-import org.codice.imaging.nitf.core.NitfSecurityMetadata;
-import org.codice.imaging.nitf.core.NitfSymbolSegment;
-import org.codice.imaging.nitf.core.NitfTextSegment;
-import org.codice.imaging.nitf.core.ParseOption;
-import org.codice.imaging.nitf.core.Tre;
-import org.codice.imaging.nitf.core.TreCollection;
-import org.codice.imaging.nitf.core.TreEntry;
-import org.codice.imaging.nitf.core.TreGroup;
+import org.codice.imaging.nitf.core.AllDataExtractionParseStrategy;
+import org.codice.imaging.nitf.core.NitfFileHeader;
+import org.codice.imaging.nitf.core.NitfFileParser;
+import org.codice.imaging.nitf.core.SlottedNitfParseStrategy;
+import org.codice.imaging.nitf.core.common.NitfDateTime;
+import org.codice.imaging.nitf.core.common.NitfInputStreamReader;
+import org.codice.imaging.nitf.core.graphic.NitfGraphicSegmentHeader;
+import org.codice.imaging.nitf.core.image.ImageCoordinates;
+import org.codice.imaging.nitf.core.image.ImageCoordinatesRepresentation;
+import org.codice.imaging.nitf.core.image.NitfImageSegmentHeader;
+import org.codice.imaging.nitf.core.label.LabelSegmentHeader;
+import org.codice.imaging.nitf.core.security.FileSecurityMetadata;
+import org.codice.imaging.nitf.core.security.SecurityMetadata;
+import org.codice.imaging.nitf.core.symbol.SymbolSegmentHeader;
+import org.codice.imaging.nitf.core.text.TextSegmentHeader;
+import org.codice.imaging.nitf.core.tre.Tre;
+import org.codice.imaging.nitf.core.tre.TreCollection;
+import org.codice.imaging.nitf.core.tre.TreEntry;
+import org.codice.imaging.nitf.core.tre.TreGroup;
+import org.joda.time.DateTimeZone;
+import org.joda.time.format.DateTimeFormat;
+import org.joda.time.format.DateTimeFormatter;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -75,6 +79,10 @@ public class NitfInputTransformer implements InputTransformer {
 
     private static final Logger LOGGER = LoggerFactory.getLogger(NitfInputTransformer.class);
 
+    private static final DateTimeFormatter DATE_TIME_FORMATTER = DateTimeFormat.
+            forPattern("yyyyMMddHHmmss").withZone(DateTimeZone.UTC);
+
+
     private CatalogFramework mCatalog;
 
     /**
@@ -95,17 +103,21 @@ public class NitfInputTransformer implements InputTransformer {
 
         MetacardImpl metacard = new MetacardImpl(new NitfMetacardType());
         try {
-            Nitf nitfFile = NitfFileFactory
-                    .parseHeadersOnly(new ByteArrayInputStream(baos.toByteArray()));
-            metacard.setCreatedDate(nitfFile.getFileDateTime().toDate());
+            SlottedNitfParseStrategy parsingStrategy = new AllDataExtractionParseStrategy();
+
+            NitfFileParser.parse(
+                    new NitfInputStreamReader(new ByteArrayInputStream(baos.toByteArray())),
+                    parsingStrategy);
+
+            metacard.setCreatedDate(getDateTime(parsingStrategy.getNitfHeader()));
             // TODO: modified date from HISTOA?
-            metacard.setTitle(nitfFile.getFileTitle());
+            metacard.setTitle(parsingStrategy.getNitfHeader().getFileTitle());
 
-            setAttributes(nitfFile, metacard);
+            setAttributes(parsingStrategy, metacard);
 
-            setLocation(nitfFile, metacard);
+            setLocation(parsingStrategy, metacard);
 
-            setMetadata(nitfFile, metacard);
+            setMetadata(parsingStrategy, metacard);
 
             if (id != null) {
                 metacard.setId(id);
@@ -115,9 +127,8 @@ public class NitfInputTransformer implements InputTransformer {
 
             metacard.setContentTypeName(MIME_TYPE);
 
-            byte[] thumbnail = getThumbnail(NitfFileFactory
-                    .parseSelectedDataSegments(new ByteArrayInputStream(baos.toByteArray()),
-                            EnumSet.allOf(ParseOption.class)));
+            byte[] thumbnail = getThumbnail(parsingStrategy);
+
             if (thumbnail != null && thumbnail.length > 0) {
                 metacard.setThumbnail(thumbnail);
             }
@@ -129,14 +140,21 @@ public class NitfInputTransformer implements InputTransformer {
         return metacard;
     }
 
-    protected byte[] getThumbnail(Nitf nitf) {
-        if (nitf.getGraphicSegments().isEmpty()) {
+    protected Date getDateTime(NitfFileHeader fileHeader) {
+
+        return DATE_TIME_FORMATTER.parseDateTime(fileHeader.getFileDateTime()
+                .getSourceString()).toDate();
+    }
+
+    protected byte[] getThumbnail(SlottedNitfParseStrategy slottedNitf) {
+
+        if (slottedNitf.getGraphicSegmentHeaders().isEmpty()) {
             LOGGER.debug("Loaded file, but found no graphic segments.");
             return null;
         }
         try {
-            NitfGraphicSegment segment = nitf.getGraphicSegments().get(0);
-            CgmParser parser = new CgmParser(segment);
+            NitfGraphicSegmentHeader segment = slottedNitf.getGraphicSegmentHeaders().get(0);
+            CgmParser parser = new CgmParser(slottedNitf.getGraphicSegmentData().get(0));
             parser.buildCommandList();
 
             if (segment.getBoundingBox2Column() > 0 && segment.getBoundingBox2Row() > 0) {
@@ -158,14 +176,18 @@ public class NitfInputTransformer implements InputTransformer {
         return null;
     }
 
-    private void setAttributes(Nitf nitfFile, MetacardImpl metacard) {
-        // TODO: The Attributes should be obtained from the Nitf library more elegantly.  There's no null checking and it requires explicit object knowledge to obtain an attribute.
+    private void setAttributes(SlottedNitfParseStrategy slottedNitf, MetacardImpl metacard) {
+
+        NitfFileHeader fileHeader = slottedNitf.getNitfHeader();
+
+        // TODO: The Attributes should be obtained from the Nitf library more elegantly.  There's
+        // no null checking and it requires explicit object knowledge to obtain an attribute.
         metacard.setAttribute(
-                new AttributeImpl(NitfMetacardType.NITF_VERSION, nitfFile.getFileType()));
-        if (nitfFile.getFileDateTime().toDate() != null) {
+                new AttributeImpl(NitfMetacardType.NITF_VERSION, fileHeader.getFileType()));
+        if (fileHeader.getFileDateTime() != null) {
             metacard.setAttribute(new AttributeImpl(NitfMetacardType.FILE_DATE_TIME,
-                    nitfFile.getFileDateTime().toDate()));
-            metacard.setModifiedDate(nitfFile.getFileDateTime().toDate());
+                    getDateTime(fileHeader)));
+            metacard.setModifiedDate(getDateTime(fileHeader));
         } else {
             Date now = new Date();
             metacard.setModifiedDate(now);
@@ -174,84 +196,85 @@ public class NitfInputTransformer implements InputTransformer {
         }
 
         metacard.setAttribute(
-                new AttributeImpl(NitfMetacardType.FILE_TITLE, nitfFile.getFileTitle()));
-        metacard.setTitle(nitfFile.getFileTitle());
+                new AttributeImpl(NitfMetacardType.FILE_TITLE, fileHeader.getFileTitle()));
+        metacard.setTitle(fileHeader.getFileTitle());
         //        metacard.setAttribute(new AttributeImpl(NitfMetacardType.FILE_SIZE,
         //                nitfFile.));
         metacard.setAttribute(new AttributeImpl(NitfMetacardType.COMPLEXITY_LEVEL,
-                nitfFile.getComplexityLevel()));
+                fileHeader.getComplexityLevel()));
         metacard.setAttribute(
-                new AttributeImpl(NitfMetacardType.ORIGINATOR_NAME, nitfFile.getOriginatorsName()));
+                new AttributeImpl(NitfMetacardType.ORIGINATOR_NAME, fileHeader.getOriginatorsName()));
         metacard.setAttribute(new AttributeImpl(NitfMetacardType.ORIGINATING_STATION_ID,
-                nitfFile.getOriginatingStationId()));
-        if (!nitfFile.getImageSegments().isEmpty()) {
+                fileHeader.getOriginatingStationId()));
+        if (!slottedNitf.getImageSegmentHeaders().isEmpty()) {
             metacard.setAttribute(new AttributeImpl(NitfMetacardType.IMAGE_ID,
-                    nitfFile.getImageSegments().get(0).getImageIdentifier2()));
+                    slottedNitf.getImageSegmentHeaders().get(0).getImageIdentifier2()));
             metacard.setAttribute(new AttributeImpl(NitfMetacardType.ISOURCE,
-                    nitfFile.getImageSegments().get(0).getImageSource()));
+                    slottedNitf.getImageSegmentHeaders().get(0).getImageSource()));
             metacard.setAttribute(new AttributeImpl(NitfMetacardType.NUMBER_OF_ROWS,
-                    nitfFile.getImageSegments().get(0).getNumberOfRows()));
+                    slottedNitf.getImageSegmentHeaders().get(0).getNumberOfRows()));
             metacard.setAttribute(new AttributeImpl(NitfMetacardType.NUMBER_OF_COLUMNS,
-                    nitfFile.getImageSegments().get(0).getNumberOfColumns()));
+                    slottedNitf.getImageSegmentHeaders().get(0).getNumberOfColumns()));
             metacard.setAttribute(new AttributeImpl(NitfMetacardType.NUMBER_OF_BANDS,
-                    nitfFile.getImageSegments().get(0).getNumBands()));
+                    slottedNitf.getImageSegmentHeaders().get(0).getNumBands()));
             //        metacard.setAttribute(new AttributeImpl(NitfMetacardType.NUMBER_OF_MULTISPECTRAL_BANDS,
             //                nitfFile.getImageSegments().get(0).getNum()));
             metacard.setAttribute(new AttributeImpl(NitfMetacardType.REPRESENTATION,
-                    nitfFile.getImageSegments().get(0).getImageRepresentation()));
+                    slottedNitf.getImageSegmentHeaders().get(0).getImageRepresentation()));
             metacard.setAttribute(new AttributeImpl(NitfMetacardType.SUBCATEGORY,
-                    nitfFile.getImageSegments().get(0).getImageCategory()));
+                    slottedNitf.getImageSegmentHeaders().get(0).getImageCategory()));
             metacard.setAttribute(new AttributeImpl(NitfMetacardType.BITS_PER_PIXEL_PER_BAND,
-                    nitfFile.getImageSegments().get(0).getNumberOfBitsPerPixelPerBand()));
+                    slottedNitf.getImageSegmentHeaders().get(0).getNumberOfBitsPerPixelPerBand()));
             metacard.setAttribute(new AttributeImpl(NitfMetacardType.IMAGE_MODE,
-                    nitfFile.getImageSegments().get(0).getImageMode()));
+                    slottedNitf.getImageSegmentHeaders().get(0).getImageMode()));
             metacard.setAttribute(new AttributeImpl(NitfMetacardType.COMPRESSION,
-                    nitfFile.getImageSegments().get(0).getImageCompression()));
+                    slottedNitf.getImageSegmentHeaders().get(0).getImageCompression()));
             metacard.setAttribute(new AttributeImpl(NitfMetacardType.RATE_CODE,
-                    nitfFile.getImageSegments().get(0).getCompressionRate()));
+                    slottedNitf.getImageSegmentHeaders().get(0).getCompressionRate()));
             metacard.setAttribute(new AttributeImpl(NitfMetacardType.TARGET_ID,
-                    nitfFile.getImageSegments().get(0).getImageTargetId().toString()));
+                    slottedNitf.getImageSegmentHeaders().get(0).getImageTargetId().toString()));
             metacard.setAttribute(new AttributeImpl(NitfMetacardType.COMMENT, Arrays.toString(
-                    nitfFile.getImageSegments().get(0).getImageComments().toArray())));
+                    slottedNitf.getImageSegmentHeaders().get(0).getImageComments().toArray())));
         }
         metacard.setAttribute(new AttributeImpl(NitfMetacardType.CODE_WORDS,
-                nitfFile.getFileSecurityMetadata().getCodewords()));
+                fileHeader.getFileSecurityMetadata().getCodewords()));
         metacard.setAttribute(new AttributeImpl(NitfMetacardType.CONTROL_CODE,
-                nitfFile.getFileSecurityMetadata().getControlAndHandling()));
+                fileHeader.getFileSecurityMetadata().getControlAndHandling()));
         metacard.setAttribute(new AttributeImpl(NitfMetacardType.RELEASE_INSTRUCTION,
-                nitfFile.getFileSecurityMetadata().getReleaseInstructions()));
+                fileHeader.getFileSecurityMetadata().getReleaseInstructions()));
         metacard.setAttribute(new AttributeImpl(NitfMetacardType.CONTROL_NUMBER,
-                nitfFile.getFileSecurityMetadata().getSecurityControlNumber()));
+                fileHeader.getFileSecurityMetadata().getSecurityControlNumber()));
         metacard.setAttribute(new AttributeImpl(NitfMetacardType.CLASSIFICATION_SYSTEM,
-                nitfFile.getFileSecurityMetadata().getSecurityClassificationSystem()));
+                fileHeader.getFileSecurityMetadata().getSecurityClassificationSystem()));
         metacard.setAttribute(new AttributeImpl(NitfMetacardType.CLASSIFICATION_AUTHORITY,
-                nitfFile.getFileSecurityMetadata().getClassificationAuthority()));
+                fileHeader.getFileSecurityMetadata().getClassificationAuthority()));
         metacard.setAttribute(new AttributeImpl(NitfMetacardType.CLASSIFICATION_AUTHORITY_TYPE,
-                nitfFile.getFileSecurityMetadata().getClassificationAuthorityType()));
+                fileHeader.getFileSecurityMetadata().getClassificationAuthorityType()));
         metacard.setAttribute(new AttributeImpl(NitfMetacardType.CLASSIFICATION_TEXT,
-                nitfFile.getFileSecurityMetadata().getSecurityClassificationSystem()));
+                fileHeader.getFileSecurityMetadata().getSecurityClassificationSystem()));
         metacard.setAttribute(new AttributeImpl(NitfMetacardType.CLASSIFICATION_REASON,
-                nitfFile.getFileSecurityMetadata().getClassificationReason()));
-        if (StringUtils.isNotEmpty(nitfFile.getFileSecurityMetadata().getSecuritySourceDate())) {
+                fileHeader.getFileSecurityMetadata().getClassificationReason()));
+        if (StringUtils.isNotEmpty(fileHeader.getFileSecurityMetadata().getSecuritySourceDate())) {
             // TODO convert to Date
             metacard.setAttribute(new AttributeImpl(NitfMetacardType.CLASSIFICATION_DATE,
-                    nitfFile.getFileSecurityMetadata().getSecuritySourceDate()));
+                    fileHeader.getFileSecurityMetadata().getSecuritySourceDate()));
         }
         metacard.setAttribute(new AttributeImpl(NitfMetacardType.DECLASSIFICATION_TYPE,
-                nitfFile.getFileSecurityMetadata().getDeclassificationType()));
+                fileHeader.getFileSecurityMetadata().getDeclassificationType()));
         metacard.setAttribute(new AttributeImpl(NitfMetacardType.DECLASSIFICATION_DATE,
-                nitfFile.getFileSecurityMetadata().getDeclassificationDate()));
+                fileHeader.getFileSecurityMetadata().getDeclassificationDate()));
         // TODO: add the TRE's as attributes to the MetacardType Dynamically?
     }
 
-    private void setLocation(Nitf nitfFile, MetacardImpl metacard) {
+    private void setLocation(SlottedNitfParseStrategy slottedNitf, MetacardImpl metacard) {
+
         GeometryFactory geomFactory = new GeometryFactory(
                 new PrecisionModel(com.vividsolutions.jts.geom.PrecisionModel.FLOATING), 4326);
-        if (nitfFile.getImageSegments().isEmpty()) {
+        if (slottedNitf.getImageSegmentHeaders().isEmpty()) {
             return;
         }
-        if (nitfFile.getImageSegments().size() == 1) {
-            NitfImageSegment segment = nitfFile.getImageSegments().get(0);
+        if (slottedNitf.getImageSegmentHeaders().size() == 1) {
+            NitfImageSegmentHeader segment = slottedNitf.getImageSegmentHeaders().get(0);
             if (segment == null) {
                 return;
             }
@@ -270,7 +293,7 @@ public class NitfInputTransformer implements InputTransformer {
             }
         } else {
             List<Polygon> polygons = new ArrayList<Polygon>();
-            for (NitfImageSegment segment : nitfFile.getImageSegments()) {
+            for (NitfImageSegmentHeader segment : slottedNitf.getImageSegmentHeaders()) {
                 if ((segment.getImageCoordinatesRepresentation()
                         == ImageCoordinatesRepresentation.GEOGRAPHIC) || (
                         segment.getImageCoordinatesRepresentation()
@@ -288,7 +311,7 @@ public class NitfInputTransformer implements InputTransformer {
         }
     }
 
-    private Polygon getPolygonForSegment(NitfImageSegment segment, GeometryFactory geomFactory) {
+    private Polygon getPolygonForSegment(NitfImageSegmentHeader segment, GeometryFactory geomFactory) {
         Coordinate[] coords = new Coordinate[5];
         ImageCoordinates imageCoordinates = segment.getImageCoordinates();
         coords[0] = new Coordinate(imageCoordinates.getCoordinate00().getLongitude(),
@@ -304,28 +327,31 @@ public class NitfInputTransformer implements InputTransformer {
         return geomFactory.createPolygon(externalRing, null);
     }
 
-    private void setMetadata(Nitf nitfFile, MetacardImpl metacard) {
+    private void setMetadata(SlottedNitfParseStrategy slottedNitf, MetacardImpl metacard) {
+
+        NitfFileHeader fileHeader = slottedNitf.getNitfHeader();
+
         // TODO: update to XStream or some xml streaming library to create this metadata
         StringBuilder metadataXml = new StringBuilder();
         metadataXml.append("<metadata>\n");
         metadataXml.append("  <file>\n");
-        metadataXml.append(buildMetadataEntry("fileType", nitfFile.getFileType().toString()));
-        metadataXml.append(buildMetadataEntry("complexityLevel", nitfFile.getComplexityLevel()));
+        metadataXml.append(buildMetadataEntry("fileType", fileHeader.getFileType().toString()));
+        metadataXml.append(buildMetadataEntry("complexityLevel", fileHeader.getComplexityLevel()));
         metadataXml.append(buildMetadataEntry("originatingStationId",
-                nitfFile.getOriginatingStationId()));
-        metadataXml.append(buildMetadataEntry("fileDateTime", nitfFile.getFileDateTime()));
-        metadataXml.append(buildMetadataEntry("fileTitle", nitfFile.getFileTitle()));
-        addFileSecurityMetadata(metadataXml, nitfFile);
-        if (nitfFile.getFileBackgroundColour() != null) {
+                fileHeader.getOriginatingStationId()));
+        metadataXml.append(buildMetadataEntry("fileDateTime", fileHeader.getFileDateTime()));
+        metadataXml.append(buildMetadataEntry("fileTitle", fileHeader.getFileTitle()));
+        addFileSecurityMetadata(metadataXml, fileHeader);
+        if (fileHeader.getFileBackgroundColour() != null) {
             metadataXml.append(buildMetadataEntry("fileBackgroundColour",
-                    nitfFile.getFileBackgroundColour().toString()));
+                    fileHeader.getFileBackgroundColour().toString()));
         }
-        metadataXml.append(buildMetadataEntry("originatorsName", nitfFile.getOriginatorsName()));
+        metadataXml.append(buildMetadataEntry("originatorsName", fileHeader.getOriginatorsName()));
         metadataXml.append(buildMetadataEntry("originatorsPhoneNumber",
-                nitfFile.getOriginatorsPhoneNumber()));
-        metadataXml.append(buildTREsMetadata(nitfFile.getTREsRawStructure()));
+                fileHeader.getOriginatorsPhoneNumber()));
+        metadataXml.append(buildTREsMetadata(fileHeader.getTREsRawStructure()));
         metadataXml.append("  </file>\n");
-        for (NitfImageSegment image : nitfFile.getImageSegments()) {
+        for (NitfImageSegmentHeader image : slottedNitf.getImageSegmentHeaders()) {
             metadataXml.append("  <image>\n");
             metadataXml.append(buildMetadataEntry("imageIdentifer1", image.getIdentifier()));
             metadataXml.append(buildMetadataEntry("imageDateTime", image.getImageDateTime()));
@@ -387,7 +413,7 @@ public class NitfInputTransformer implements InputTransformer {
             metadataXml.append(buildTREsMetadata(image.getTREsRawStructure()));
             metadataXml.append("  </image>\n");
         }
-        for (NitfGraphicSegment graphic : nitfFile.getGraphicSegments()) {
+        for (NitfGraphicSegmentHeader graphic : slottedNitf.getGraphicSegmentHeaders()) {
             metadataXml.append("  <graphic>\n");
             metadataXml.append(buildMetadataEntry("graphicIdentifier", graphic.getIdentifier()));
             metadataXml.append(buildMetadataEntry("graphicName", graphic.getGraphicName()));
@@ -413,7 +439,7 @@ public class NitfInputTransformer implements InputTransformer {
             metadataXml.append(buildTREsMetadata(graphic.getTREsRawStructure()));
             metadataXml.append("  </graphic>\n");
         }
-        for (NitfSymbolSegment symbol : nitfFile.getSymbolSegments()) {
+        for (SymbolSegmentHeader symbol : slottedNitf.getSymbolSegmentHeaders()) {
             metadataXml.append("  <symbol>\n");
             metadataXml.append(buildMetadataEntry("symbolIdentifier", symbol.getIdentifier()));
             metadataXml.append(buildMetadataEntry("symbolName", symbol.getSymbolName()));
@@ -445,7 +471,7 @@ public class NitfInputTransformer implements InputTransformer {
             metadataXml.append(buildTREsMetadata(symbol.getTREsRawStructure()));
             metadataXml.append("  </symbol>\n");
         }
-        for (NitfLabelSegment label : nitfFile.getLabelSegments()) {
+        for (LabelSegmentHeader label : slottedNitf.getLabelSegmentHeaders()) {
             metadataXml.append("  <label>\n");
             metadataXml.append(buildMetadataEntry("labelIdentifier", label.getIdentifier()));
             addSecurityMetadata(metadataXml, label.getSecurityMetadata());
@@ -465,7 +491,7 @@ public class NitfInputTransformer implements InputTransformer {
             metadataXml.append(buildTREsMetadata(label.getTREsRawStructure()));
             metadataXml.append("  </label>\n");
         }
-        for (NitfTextSegment text : nitfFile.getTextSegments()) {
+        for (TextSegmentHeader text : slottedNitf.getTextSegmentHeaders()) {
             metadataXml.append("  <text>\n");
             metadataXml.append(buildMetadataEntry("textIdentifier", text.getIdentifier()));
             addSecurityMetadata(metadataXml, text.getSecurityMetadata());
@@ -537,7 +563,7 @@ public class NitfInputTransformer implements InputTransformer {
     }
 
     private String buildMetadataEntry(String label, NitfDateTime value) {
-        return buildMetadataEntry(label, value.toDate().toString());
+        return buildMetadataEntry(label, value.getSourceString());
     }
 
     private String buildMetadataEntry(String label, String value) {
@@ -552,8 +578,8 @@ public class NitfInputTransformer implements InputTransformer {
         return entryBuilder.toString();
     }
 
-    private void addFileSecurityMetadata(StringBuilder metadataXml, Nitf nitfFile) {
-        NitfFileSecurityMetadata security = nitfFile.getFileSecurityMetadata();
+    private void addFileSecurityMetadata(StringBuilder metadataXml, NitfFileHeader nitfFile) {
+        FileSecurityMetadata security = nitfFile.getFileSecurityMetadata();
         addSecurityMetadata(metadataXml, security);
         metadataXml.append(buildMetadataEntry("securityFileCopyNumber",
                 nitfFile.getFileSecurityMetadata().getFileCopyNumber()));
@@ -561,7 +587,7 @@ public class NitfInputTransformer implements InputTransformer {
                 nitfFile.getFileSecurityMetadata().getFileNumberOfCopies()));
     }
 
-    private void addSecurityMetadata(StringBuilder metadataXml, NitfSecurityMetadata security) {
+    private void addSecurityMetadata(StringBuilder metadataXml, SecurityMetadata security) {
         metadataXml.append(buildMetadataEntry("securityClassification",
                 security.getSecurityClassification().toString()));
         addMetadataIfNotNull(metadataXml, "securityClassificationSystem",
